@@ -3,13 +3,10 @@
 
 #include "targets.h"
 #include "crsf_protocol.h"
-#if defined(CRSF_RX_MODULE) && defined(USE_MSP_WIFI)
-#include "crsf2msp.h"
-#include "msp2crsf.h"
-#endif
 #ifndef TARGET_NATIVE
 #include "HardwareSerial.h"
 #endif
+#include "common.h"
 #include "msp.h"
 #include "msptypes.h"
 #include "LowPassFilter.h"
@@ -29,36 +26,17 @@ class CRSF
 {
 
 public:
-    #if CRSF_RX_MODULE
-    CRSF(Stream *dev) : _dev(dev)
-    {
-    }
+    /////Variables/////
 
-    CRSF(Stream &dev) : _dev(&dev) {}
-
-    #if defined(USE_MSP_WIFI)
-    static CROSSFIRE2MSP crsf2msp;
-    static MSP2CROSSFIRE msp2crsf;
-    #endif
-    #endif
-
-
+    #ifdef CRSF_TX_MODULE
     static HardwareSerial Port;
     static Stream *PortSecondary; // A second UART used to mirror telemetry out on the TX, not read from
 
-    static uint32_t ChannelData[CRSF_NUM_CHANNELS]; // Current state of channels, CRSF format
-
-    /////Variables/////
-
-
-    static uint8_t ParameterUpdateData[3];
-
-    #ifdef CRSF_TX_MODULE
     static void (*disconnected)();
     static void (*connected)();
 
     static void (*RecvModelUpdate)();
-    static void (*RecvParameterUpdate)();
+    static void (*RecvParameterUpdate)(uint8_t type, uint8_t index, uint8_t arg);
     static void (*RCdataCallback)();
 
     // The model ID as received from the Transmitter
@@ -115,19 +93,10 @@ public:
     static void ICACHE_RAM_ATTR RcPacketToChannelsData();
     #endif
 
-    #ifdef CRSF_RX_MODULE
-    bool RXhandleUARTout();
-    void ICACHE_RAM_ATTR sendRCFrameToFC();
-    void ICACHE_RAM_ATTR sendMSPFrameToFC(uint8_t* data);
-    void sendLinkStatisticsToFC();
-    #endif
-
     /////////////////////////////////////////////////////////////
     static bool CRSFstate;
 
 private:
-    Stream *_dev;
-
     static inBuffer_U inBuffer;
 
 #if CRSF_TX_MODULE
@@ -167,9 +136,8 @@ private:
     static void handleUARTout();
     static bool UARTwdt();
     static uint32_t autobaud();
-#endif
-
     static void flush_port_input(void);
+#endif
 };
 
 extern GENERIC_CRC8 crsf_crc;

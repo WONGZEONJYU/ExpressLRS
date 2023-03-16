@@ -39,11 +39,32 @@ config = {
             "ssid":"network-ssid",
             "mode":"STA",
             "modelid":255,
-            "pwm":[512,1536,2048,3584,4608],
-            "product_name":
-            "Generic ESP8285 + 5xPWM 2.4Ghz RX",
-            "lua_name":"ELRS+PWM 2400RX",
-            "reg_domain":"ISM2G4",
+            "pwm":[
+                {
+                    "config": 512,
+                    "pin": 0
+                },
+                {
+                    "config": 1536,
+                    "pin": 4
+                },
+                {
+                    "config": 2048,
+                    "pin": 5
+                },
+                {
+                    "config": 3584,
+                    "pin": 1
+                },
+                {
+                    "config": 4608,
+                    "pin": 3
+                }
+            ],
+            "serial-protocol": 3,
+            "product_name": "Generic ESP8285 + 5xPWM 2.4Ghz RX",
+            "lua_name": "ELRS+PWM 2400RX",
+            "reg_domain": "ISM2G4",
             "button-actions": [
                 {
                     "color" : 255,
@@ -137,6 +158,13 @@ def options():
 def update_config():
     if (request.json['button-actions'] is not None):
         config['config']['button-actions'] = request.json['button-actions']
+    return "Config Updated"
+
+@route('/import', method='POST')
+def import_config():
+    json = request.json
+    print(json)
+    return "Config Updated"
 
 @route('/sethome', method='POST')
 def options():
