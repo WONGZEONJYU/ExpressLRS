@@ -18,6 +18,7 @@ typedef enum {
     HARDWARE_radio_nss,
     HARDWARE_radio_nss_2,
     HARDWARE_radio_rst,
+    HARDWARE_radio_rst_2,
     HARDWARE_radio_sck,
     HARDWARE_radio_dcdc,
     HARDWARE_radio_rfo_hf,
@@ -28,7 +29,7 @@ typedef enum {
 
     // Radio power
     HARDWARE_power_enable,
-    HARDWARE_power_apc1, // stm32
+    HARDWARE_power_apc1,
     HARDWARE_power_apc2,
     HARDWARE_power_rxen,
     HARDWARE_power_txen,
@@ -46,6 +47,8 @@ typedef enum {
 
     HARDWARE_power_control,
     HARDWARE_power_values,
+    HARDWARE_power_values2,
+    HARDWARE_power_values_dual,
 
     // Input
     HARDWARE_joystick,
@@ -69,7 +72,7 @@ typedef enum {
     HARDWARE_led_green_red,
     HARDWARE_led_red,
     HARDWARE_led_red_invert,
-    HARDWARE_led_reg_green,
+    HARDWARE_led_red_green,
     HARDWARE_led_rgb,
     // GPIO_PIN_LED_WS2812_FAST // stm32
     HARDWARE_led_rgb_isgrb,
@@ -123,6 +126,7 @@ typedef enum {
     HARDWARE_vbat,
     HARDWARE_vbat_offset,
     HARDWARE_vbat_scale,
+    HARDWARE_vbat_atten,
 
     // VTX
     HARDWARE_vtx_amp_pwm,
@@ -134,6 +138,8 @@ typedef enum {
     HARDWARE_vtx_sck,
     HARDWARE_vtx_amp_vpd_25mW,
     HARDWARE_vtx_amp_vpd_100mW,
+    HARDWARE_vtx_amp_pwm_25mW,
+    HARDWARE_vtx_amp_pwm_100mW,
 
     HARDWARE_LAST
 } nameType;

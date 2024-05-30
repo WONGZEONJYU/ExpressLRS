@@ -6,7 +6,9 @@
 #include "helpers.h"
 #include "logging.h"
 #include "POWERMGNT.h"
-#include "CRSF.h"
+#include "handset.h"
+#include "OTA.h"
+#include "deferred.h"
 
 #ifdef HAS_THERMAL
 #include "thermal.h"
@@ -16,14 +18,15 @@ extern Thermal thermal;
 
 extern FiniteStateMachine state_machine;
 
-extern void EnterBindingMode();
-extern bool InBindingMode;
 extern bool RxWiFiReadyToSend;
 extern bool TxBackpackWiFiReadyToSend;
 extern bool VRxBackpackWiFiReadyToSend;
 extern void VtxTriggerSend();
 extern void ResetPower();
 extern void setWifiUpdateMode();
+extern void SetSyncSpam();
+extern uint8_t adjustPacketRateForBaud(uint8_t rate);
+extern uint8_t adjustSwitchModeForAirRate(OtaSwitchMode_e eSwitchMode, uint8_t packetSize);
 
 extern Display *display;
 
@@ -74,7 +77,7 @@ static void displayIdleScreen(bool init)
     message_index_t disp_message;
     if (connectionState == noCrossfire || connectionState > FAILURE_STATES) {
         disp_message = MSG_ERROR;
-    } else if(CRSF::IsArmed()) {
+    } else if(handset->IsArmed()) {
         disp_message = MSG_ARMED;
     } else if(connectionState == connected) {
         if (connectionHasModelMatch) {
@@ -136,6 +139,16 @@ static void setupValueIndex(bool init)
         values_max = display->getValueCount((menu_item_t)state_machine.getParentState())-1;
         values_index = config.GetRate();
         break;
+    case STATE_SWITCH:
+        values_min = 0;
+        values_max = display->getValueCount((menu_item_t)state_machine.getParentState())-1;
+        values_index = config.GetSwitchMode();
+        break;
+    case STATE_ANTENNA:
+        values_min = 0;
+        values_max = display->getValueCount((menu_item_t)state_machine.getParentState())-1;
+        values_index = config.GetAntennaMode();
+        break;
     case STATE_TELEMETRY:
         values_min = 0;
         values_max = display->getValueCount((menu_item_t)state_machine.getParentState())-1;
@@ -154,7 +167,7 @@ static void setupValueIndex(bool init)
 
     case STATE_POWER_MAX:
         values_min = MinPower;
-        values_max = MaxPower;
+        values_max = POWERMGNT::getMaxPower();
         values_index = config.GetPower();
         break;
     case STATE_POWER_DYNAMIC:
@@ -205,13 +218,46 @@ static void decrementValueIndex(bool init)
 
 static void saveValueIndex(bool init)
 {
+    auto val = values_index;
     switch (state_machine.getParentState())
     {
-        case STATE_PACKET:
-            config.SetRate(values_index);
+        case STATE_PACKET: {
+            uint8_t actualRate = adjustPacketRateForBaud(val);
+            uint8_t newSwitchMode = adjustSwitchModeForAirRate(
+                (OtaSwitchMode_e)config.GetSwitchMode(), get_elrs_airRateConfig(actualRate)->PayloadLength);
+            // If the switch mode is going to change, block the change while connected
+            if (newSwitchMode == OtaSwitchModeCurrent || connectionState == disconnected)
+            {
+                deferExecutionMillis(100, [actualRate, newSwitchMode](){
+                    config.SetRate(actualRate);
+                    config.SetSwitchMode(newSwitchMode);
+                    OtaUpdateSerializers((OtaSwitchMode_e)newSwitchMode, ExpressLRS_currAirRate_Modparams->PayloadLength);
+                    SetSyncSpam();
+                });
+            }
+            break;
+        }
+        case STATE_SWITCH: {
+            // Only allow changing switch mode when disconnected since we need to guarantee
+            // the pack and unpack functions are matched
+            if (connectionState == disconnected)
+            {
+                deferExecutionMillis(100, [val](){
+                    config.SetSwitchMode(val);
+                    OtaUpdateSerializers((OtaSwitchMode_e)val, ExpressLRS_currAirRate_Modparams->PayloadLength);
+                    SetSyncSpam();
+                });
+            }
+            break;
+        }
+        case STATE_ANTENNA:
+            config.SetAntennaMode(values_index);
             break;
         case STATE_TELEMETRY:
-            config.SetTlm(values_index);
+            deferExecutionMillis(100, [val](){
+                config.SetTlm(val);
+                SetSyncSpam();
+            });
             break;
         case STATE_POWERSAVE:
             config.SetMotionMode(values_index);
@@ -388,7 +434,7 @@ static void executeBind(bool init)
 {
     if (init)
     {
-        EnterBindingMode();
+        EnterBindingModeSafely();
         display->displayBindStatus();
         return;
     }
@@ -554,6 +600,8 @@ fsm_state_event_t const wifi_menu_events[] = {MENU_EVENTS(wifi_menu_fsm)};
 
 fsm_state_entry_t const main_menu_fsm[] = {
     {STATE_PACKET, nullptr, displayMenuScreen, 20000, value_menu_events, ARRAY_SIZE(value_menu_events)},
+    {STATE_SWITCH, nullptr, displayMenuScreen, 20000, value_menu_events, ARRAY_SIZE(value_menu_events)},
+    {STATE_ANTENNA, [](){return isDualRadio();}, displayMenuScreen, 20000, value_menu_events, ARRAY_SIZE(value_menu_events)},
     {STATE_POWER, nullptr, displayMenuScreen, 20000, power_menu_events, ARRAY_SIZE(power_menu_events)},
     {STATE_TELEMETRY, [](){return !firmwareOptions.is_airport;}, displayMenuScreen, 20000, value_menu_events, ARRAY_SIZE(value_menu_events)},
 #ifdef HAS_GSENSOR

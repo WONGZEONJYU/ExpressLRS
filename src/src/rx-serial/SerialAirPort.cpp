@@ -5,43 +5,38 @@
 #include "common.h"
 
 // Variables / constants for Airport //
-FIFO_GENERIC<AP_MAX_BUF_LEN> apInputBuffer;
-FIFO_GENERIC<AP_MAX_BUF_LEN> apOutputBuffer;
+FIFO<AP_MAX_BUF_LEN> apInputBuffer;
+FIFO<AP_MAX_BUF_LEN> apOutputBuffer;
 
 
-void SerialAirPort::setLinkQualityStats(uint16_t lq, uint16_t rssi)
-{
-    // unsupported
-}
-
-void SerialAirPort::sendLinkStatisticsToFC()
-{
-    // unsupported
-}
-
-uint32_t SerialAirPort::sendRCFrameToFC(bool frameAvailable, uint32_t *channelData)
+uint32_t SerialAirPort::sendRCFrame(bool frameAvailable, bool frameMissed, uint32_t *channelData)
 {
     return DURATION_IMMEDIATELY;
 }
 
-void SerialAirPort::sendMSPFrameToFC(uint8_t* data)
+int SerialAirPort::getMaxSerialReadSize()
 {
-    // unsupported
+    return AP_MAX_BUF_LEN - apInputBuffer.size();
 }
 
-void SerialAirPort::processByte(uint8_t byte)
+void SerialAirPort::processBytes(uint8_t *bytes, u_int16_t size)
 {
-    if (apInputBuffer.size() < AP_MAX_BUF_LEN && connectionState == connected)
+    if (connectionState == connected)
     {
-        apInputBuffer.push(byte);
+        apInputBuffer.atomicPushBytes(bytes, size);
     }
 }
 
-void SerialAirPort::handleUARTout()
+void SerialAirPort::sendQueuedData(uint32_t maxBytesToSend)
 {
-    while (apOutputBuffer.size())
+    auto size = apOutputBuffer.size();
+    if (size != 0)
     {
-        _outputPort->write(apOutputBuffer.pop());
+        uint8_t buf[size];
+        apOutputBuffer.lock();
+        apOutputBuffer.popBytes(buf, size);
+        apOutputBuffer.unlock();
+        _outputPort->write(buf, size);
     }
 }
 #endif

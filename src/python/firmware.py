@@ -17,6 +17,7 @@ class DeviceType(Enum):
 class RadioType(Enum):
     SX127X = 0
     SX1280 = 1
+    LR1121 = 2
 
 class FirmwareOptions(NamedTuple):
     hasWiFi: bool
@@ -27,6 +28,7 @@ class FirmwareOptions(NamedTuple):
     luaName: str
     bootloader: str
     offset: int
+    firmware: str
 
 def find_patch_location(mm):
     return mm.find(b'\xBE\xEF\xBA\xBE\xCA\xFE\xF0\x0D')

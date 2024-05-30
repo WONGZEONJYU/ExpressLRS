@@ -12,13 +12,17 @@
 #include "msptypes.h"
 #include "PFD.h"
 #include "options.h"
+#include "dynpower.h"
 #include "MeanAccumulator.h"
+#include "freqTable.h"
 
 #include "rx-serial/SerialIO.h"
 #include "rx-serial/SerialNOOP.h"
 #include "rx-serial/SerialCRSF.h"
 #include "rx-serial/SerialSBUS.h"
+#include "rx-serial/SerialSUMD.h"
 #include "rx-serial/SerialAirPort.h"
+#include "rx-serial/SerialHoTT_TLM.h"
 
 #include "rx-serial/devSerialIO.h"
 #include "devLED.h"
@@ -30,8 +34,10 @@
 #include "devAnalogVbat.h"
 #include "devSerialUpdate.h"
 #include "devBaro.h"
+#include "devMSPVTX.h"
 
 #if defined(PLATFORM_ESP8266)
+#include <user_interface.h>
 #include <FS.h>
 #elif defined(PLATFORM_ESP32)
 #include <SPIFFS.h>
@@ -45,7 +51,11 @@
 #define SEND_LINK_STATS_TO_FC_INTERVAL 100
 #define DIVERSITY_ANTENNA_INTERVAL 5
 #define DIVERSITY_ANTENNA_RSSI_TRIGGER 5
+#if defined(RADIO_LR1121)
+#define PACKET_TO_TOCK_SLACK 240 // Desired buffer time between Packet ISR and Tock ISR. Increase slack due to the LR1121s slow processing time.  Mainly required for 500Hz mode.
+#else
 #define PACKET_TO_TOCK_SLACK 200 // Desired buffer time between Packet ISR and Tock ISR
+#endif
 ///////////////////
 
 device_affinity_t ui_devices[] = {
@@ -78,13 +88,14 @@ device_affinity_t ui_devices[] = {
 #ifdef HAS_BARO
   {&Baro_device, 0}, // must come after AnalogVbat_device to slow updates
 #endif
+#ifdef HAS_MSP_VTX
+  {&MSPVTx_device, 0}, // dependency on VTxSPI_device
+#endif
 };
 
 uint8_t antenna = 0;    // which antenna is currently in use
 uint8_t geminiMode = 0;
 
-hwTimer hwTimer;
-POWERMGNT POWERMGNT;
 PFD PFDloop;
 Crc2Byte ota_crc;
 ELRS_EEPROM eeprom;
@@ -138,6 +149,7 @@ static uint8_t telemetryBurstMax;
 StubbornReceiver MspReceiver;
 uint8_t MspData[ELRS_MSP_BUFFER];
 
+static bool tlmSent = false;
 static uint8_t NextTelemetryType = ELRS_TELEMETRY_TYPE_LINK;
 static bool telemBurstValid;
 /// PFD Filters ////////////////
@@ -204,20 +216,8 @@ static bool debugRcvrLinkstatsPending;
 static uint8_t debugRcvrLinkstatsFhssIdx;
 #endif
 
-#define LOAN_BIND_TIMEOUT_DEFAULT 60000
-#define LOAN_BIND_TIMEOUT_MSP 10000U
+bool BindingModeRequest = false;
 
-
-bool InBindingMode = false;
-bool InLoanBindingMode = false;
-bool returnModelFromLoan = false;
-static unsigned long loanBindTimeout = LOAN_BIND_TIMEOUT_DEFAULT;
-static unsigned long loadBindingStartedMs = 0;
-
-void reset_into_bootloader(void);
-void EnterBindingMode();
-void ExitBindingMode();
-void OnELRSBindMSP(uint8_t* packet);
 extern void setWifiUpdateMode();
 
 uint8_t getLq()
@@ -229,7 +229,7 @@ static inline void checkGeminiMode()
 {
     if (isDualRadio())
     {
-        geminiMode = config.GetAntennaMode();
+        geminiMode = config.GetAntennaMode() || FHSSuseDualBand; // Force Gemini when in DualBand mode.  Whats the point of using a single frequency!
     }
 }
 
@@ -251,13 +251,25 @@ static uint8_t minLqForChaos()
 
 void ICACHE_RAM_ATTR getRFlinkInfo()
 {
+    int32_t rssiDBM = Radio.LastPacketRSSI;
+
     if (GPIO_PIN_NSS_2 != UNDEF_PIN)
     {
+        int32_t rssiDBM2 = Radio.LastPacketRSSI2;
+
+        #if !defined(DEBUG_RCVR_LINKSTATS)
+        rssiDBM = LPF_UplinkRSSI0.update(rssiDBM);
+        rssiDBM2 = LPF_UplinkRSSI1.update(rssiDBM2);
+        #endif
+        rssiDBM = (rssiDBM > 0) ? 0 : rssiDBM;
+        rssiDBM2 = (rssiDBM2 > 0) ? 0 : rssiDBM2;
+
+        // BetaFlight/iNav expect positive values for -dBm (e.g. -80dBm -> sent as 80)
+        CRSF::LinkStatistics.uplink_RSSI_1 = -rssiDBM;
+        CRSF::LinkStatistics.uplink_RSSI_2 = -rssiDBM2;
         antenna = (Radio.GetProcessingPacketRadio() == SX12XX_Radio_1) ? 0 : 1;
     }
-
-    int32_t rssiDBM = Radio.LastPacketRSSI;
-    if (antenna == 0)
+    else if (antenna == 0)
     {
         #if !defined(DEBUG_RCVR_LINKSTATS)
         rssiDBM = LPF_UplinkRSSI0.update(rssiDBM);
@@ -277,11 +289,6 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
         CRSF::LinkStatistics.uplink_RSSI_2 = -rssiDBM;
     }
 
-    serialIO->setLinkQualityStats(
-        UINT10_to_CRSF(fmap(uplinkLQ, 0, 100, 0, 1023)),
-        UINT10_to_CRSF(map(constrain(rssiDBM, ExpressLRS_currAirRate_RFperfParams->RXsensitivity, -50),
-                                                   ExpressLRS_currAirRate_RFperfParams->RXsensitivity, -50, 0, 1023))
-    );
     SnrMean.add(Radio.LastPacketSNRRaw);
 
     CRSF::LinkStatistics.active_antenna = antenna;
@@ -303,23 +310,39 @@ void ICACHE_RAM_ATTR getRFlinkInfo()
     #endif
 }
 
-void SetRFLinkRate(uint8_t index) // Set speed of RF link
+void SetRFLinkRate(uint8_t index, bool bindMode) // Set speed of RF link
 {
     expresslrs_mod_settings_s *const ModParams = get_elrs_airRateConfig(index);
     expresslrs_rf_pref_params_s *const RFperf = get_elrs_RFperfParams(index);
-    bool invertIQ = UID[5] & 0x01;
+    // Binding always uses invertIQ
+    bool invertIQ = bindMode || (UID[5] & 0x01);
 
     uint32_t interval = ModParams->interval;
 #if defined(DEBUG_FREQ_CORRECTION) && defined(RADIO_SX128X)
     interval = interval * 12 / 10; // increase the packet interval by 20% to allow adding packet header
 #endif
-    hwTimer.updateInterval(interval);
-    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, GetInitialFreq(),
+
+    hwTimer::updateInterval(interval);
+
+    FHSSusePrimaryFreqBand = !(ModParams->radio_type == RADIO_TYPE_LR1121_LORA_2G4);
+    FHSSuseDualBand = ModParams->radio_type == RADIO_TYPE_LR1121_LORA_DUAL;
+
+    Radio.Config(ModParams->bw, ModParams->sf, ModParams->cr, FHSSgetInitialFreq(),
                  ModParams->PreambleLen, invertIQ, ModParams->PayloadLength, 0
 #if defined(RADIO_SX128X)
                  , uidMacSeedGet(), OtaCrcInitializer, (ModParams->radio_type == RADIO_TYPE_SX128x_FLRC)
 #endif
                  );
+
+#if defined(RADIO_LR1121)
+    if (FHSSuseDualBand)
+    {
+        Radio.Config(ModParams->bw2, ModParams->sf2, ModParams->cr2, FHSSgetInitialGeminiFreq(),
+                    ModParams->PreambleLen2, invertIQ, ModParams->PayloadLength, 0, SX12XX_Radio_2);
+    }
+#endif
+
+    Radio.FuzzySNRThreshold = (RFperf->DynpowerSnrThreshUp == DYNPOWER_SNR_THRESH_NONE) ? 0 : (RFperf->DynpowerSnrThreshDn - RFperf->DynpowerSnrThreshUp);
 
     checkGeminiMode();
     if (geminiMode)
@@ -353,15 +376,17 @@ bool ICACHE_RAM_ATTR HandleFHSS()
 
     if (geminiMode)
     {
-        if (((OtaNonce + 1)/ExpressLRS_currAirRate_Modparams->FHSShopInterval) % 2 == 0)
+        if ((((OtaNonce + 1)/ExpressLRS_currAirRate_Modparams->FHSShopInterval) % 2 == 0) || FHSSuseDualBand) // When in DualBand do not switch between radios.  The OTA modulation paramters and HighFreq/LowFreq Tx amps are set during Config.
         {
             Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_1);
             Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_2);
         }
         else
         {
-            Radio.SetFrequencyReg(FHSSgetNextFreq(), SX12XX_Radio_2);
+            // Write radio1 first. This optimises the SPI traffic order.
+            uint32_t freqRadio2 = FHSSgetNextFreq();
             Radio.SetFrequencyReg(FHSSgetGeminiFreq(), SX12XX_Radio_1);
+            Radio.SetFrequencyReg(freqRadio2, SX12XX_Radio_2);
         }
     }
     else
@@ -397,7 +422,14 @@ void ICACHE_RAM_ATTR LinkStatsToOta(OTA_LinkStats_s * const ls)
 #if defined(DEBUG_FREQ_CORRECTION)
     ls->SNR = FreqCorrection * 127 / FreqCorrectionMax;
 #else
-    ls->SNR = SnrMean.mean();
+    if (SnrMean.getCount())
+    {
+        ls->SNR = SnrMean.mean();
+    }
+    else
+    {
+        ls->SNR = SnrMean.previousMean();
+    }
 #endif
 }
 
@@ -405,14 +437,10 @@ bool ICACHE_RAM_ATTR HandleSendTelemetryResponse()
 {
     uint8_t modresult = (OtaNonce + 1) % ExpressLRS_currTlmDenom;
 
-    if (config.GetForceTlmOff() || (connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) || (alreadyTLMresp == true) || (modresult != 0))
+    if ((connectionState == disconnected) || (ExpressLRS_currTlmDenom == 1) || (alreadyTLMresp == true) || (modresult != 0) || !teamraceHasModelMatch)
     {
         return false; // don't bother sending tlm if disconnected or TLM is off
     }
-
-#if defined(Regulatory_Domain_EU_CE_2400)
-    BeginClearChannelAssessment();
-#endif
 
     // ESP requires word aligned buffer
     WORD_ALIGNED_ATTR OTA_Packet_s otaPkt = {0};
@@ -479,21 +507,25 @@ bool ICACHE_RAM_ATTR HandleSendTelemetryResponse()
 
     OtaGeneratePacketCrc(&otaPkt);
 
-    SX12XX_Radio_Number_t transmittingRadio = geminiMode ? SX12XX_Radio_All : SX12XX_Radio_Default;
-    SX12XX_Radio_Number_t clearChannelsMask = SX12XX_Radio_All;
+    SX12XX_Radio_Number_t transmittingRadio = geminiMode ? SX12XX_Radio_All : Radio.GetLastSuccessfulPacketRadio();
+
 #if defined(Regulatory_Domain_EU_CE_2400)
-    clearChannelsMask = ChannelIsClear(transmittingRadio);
-    if (clearChannelsMask)
+    transmittingRadio &= ChannelIsClear(transmittingRadio);   // weed out the radio(s) if channel in use
 #endif
+
+    if (config.GetForceTlmOff())
     {
-        Radio.TXnb((uint8_t*)&otaPkt, ExpressLRS_currAirRate_Modparams->PayloadLength, transmittingRadio & clearChannelsMask);
+        transmittingRadio = SX12XX_Radio_NONE;
     }
+
+    Radio.TXnb((uint8_t*)&otaPkt, ExpressLRS_currAirRate_Modparams->PayloadLength, transmittingRadio);
+
     return true;
 }
 
-uint32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value)
+int32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value)
 {
-    uint32_t tempFC = FreqCorrection;
+    int32_t tempFC = FreqCorrection;
     if (Radio.GetProcessingPacketRadio() == SX12XX_Radio_2)
     {
         tempFC = FreqCorrection_2;
@@ -504,10 +536,10 @@ uint32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value)
         if (tempFC > FreqCorrectionMin)
         {
             tempFC--; // FREQ_STEP units
-        }
-        else
-        {
-            DBGLN("Max -FreqCorrection reached!");
+            if (tempFC == FreqCorrectionMin)
+            {
+                DBGLN("Max -FreqCorrection reached!");
+            }
         }
     }
     else
@@ -515,10 +547,10 @@ uint32_t ICACHE_RAM_ATTR HandleFreqCorr(bool value)
         if (tempFC < FreqCorrectionMax)
         {
             tempFC++; // FREQ_STEP units
-        }
-        else
-        {
-            DBGLN("Max +FreqCorrection reached!");
+            if (tempFC == FreqCorrectionMax)
+            {
+                DBGLN("Max +FreqCorrection reached!");
+            }
         }
     }
 
@@ -552,25 +584,25 @@ void ICACHE_RAM_ATTR updatePhaseLock()
             {
                 if (Offset > 0)
                 {
-                    hwTimer.incFreqOffset();
+                    hwTimer::incFreqOffset();
                 }
                 else if (Offset < 0)
                 {
-                    hwTimer.decFreqOffset();
+                    hwTimer::decFreqOffset();
                 }
             }
         }
 
         if (connectionState != connected)
         {
-            hwTimer.phaseShift(RawOffset >> 1);
+            hwTimer::phaseShift(RawOffset >> 1);
         }
         else
         {
-            hwTimer.phaseShift(Offset >> 2);
+            hwTimer::phaseShift(Offset >> 2);
         }
 
-        DBGVLN("%d:%d:%d:%d:%d", Offset, RawOffset, OffsetDx, hwTimer.FreqOffset, uplinkLQ);
+        DBGVLN("%d:%d:%d:%d:%d", Offset, RawOffset, OffsetDx, hwTimer::getFreqOffset(), uplinkLQ);
         UNUSED(OffsetDx); // complier warning if no debug
     }
 
@@ -698,12 +730,35 @@ static void ICACHE_RAM_ATTR updateDiversity()
 
 void ICACHE_RAM_ATTR HWtimerCallbackTock()
 {
+    if (tlmSent && Radio.GetLastTransmitRadio() == SX12XX_Radio_NONE)
+    {
+        // Since we were meant to send telemetry, but didn't, defer TXdoneCallback() to when the IRQ is normally triggered.
+        deferExecutionMicros(ExpressLRS_currAirRate_RFperfParams->TOA, []() {
+            Radio.TXdoneCallback();
+        });
+    }
+
     PFDloop.intEvent(micros()); // our internal osc just fired
 
-    if (ExpressLRS_currAirRate_Modparams->numOfSends > 1 && !(OtaNonce % ExpressLRS_currAirRate_Modparams->numOfSends) && LQCalcDVDA.currentIsSet())
+    if (ExpressLRS_currAirRate_Modparams->numOfSends > 1 && !(OtaNonce % ExpressLRS_currAirRate_Modparams->numOfSends))
     {
-        crsfRCFrameAvailable();
-        servoNewChannelsAvaliable();
+        if (LQCalcDVDA.currentIsSet())
+        {
+            crsfRCFrameAvailable();
+            if (teamraceHasModelMatch)
+                servoNewChannelsAvailable();
+        }
+        else
+        {
+            crsfRCFrameMissed();
+        }
+    }
+    else if (ExpressLRS_currAirRate_Modparams->numOfSends == 1)
+    {
+        if (!LQCalc.currentIsSet())
+        {
+            crsfRCFrameMissed();
+        }
     }
 
     if (!didFHSS)
@@ -712,8 +767,9 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
     }
     didFHSS = false;
 
+    Radio.isFirstRxIrq = true;
     updateDiversity();
-    bool tlmSent = HandleSendTelemetryResponse();
+    tlmSent = HandleSendTelemetryResponse();
 
     #if defined(DEBUG_RX_SCOREBOARD)
     static bool lastPacketWasTelemetry = false;
@@ -726,17 +782,16 @@ void ICACHE_RAM_ATTR HWtimerCallbackTock()
 
 void LostConnection(bool resumeRx)
 {
-    DBGLN("lost conn fc=%d fo=%d", FreqCorrection, hwTimer.FreqOffset);
+    DBGLN("lost conn fc=%d fo=%d", FreqCorrection, hwTimer::getFreqOffset());
+
+    // Use this rate as the initial rate next time if we connected on it
+    if (connectionState == connected)
+        config.SetRateInitialIdx(ExpressLRS_nextAirRateIndex);
 
     RFmodeCycleMultiplier = 1;
     connectionState = disconnected; //set lost connection
     RXtimerState = tim_disconnected;
-    hwTimer.resetFreqOffset();
-    FreqCorrection = 0;
-    FreqCorrection_2 = 0;
-    #if defined(RADIO_SX127X)
-    Radio.SetPPMoffsetReg(0);
-    #endif
+    hwTimer::resetFreqOffset();
     PfdPrevRawOffset = 0;
     GotConnectionMillis = 0;
     uplinkLQ = 0;
@@ -752,9 +807,9 @@ void LostConnection(bool resumeRx)
         if (hwTimer::running)
         {
             while(micros() - PFDloop.getIntEventTime() > 250); // time it just after the tock()
-            hwTimer.stop();
+            hwTimer::stop();
         }
-        SetRFLinkRate(ExpressLRS_nextAirRateIndex); // also sets to initialFreq
+        SetRFLinkRate(ExpressLRS_nextAirRateIndex, false); // also sets to initialFreq
         // If not resumRx, Radio will be left in SX127x_OPMODE_STANDBY / SX1280_MODE_STDBY_XOSC
         if (resumeRx)
         {
@@ -770,14 +825,12 @@ void ICACHE_RAM_ATTR TentativeConnection(unsigned long now)
     connectionHasModelMatch = false;
     RXtimerState = tim_disconnected;
     DBGLN("tentative conn");
-    FreqCorrection = 0;
-    FreqCorrection_2 = 0;
     PfdPrevRawOffset = 0;
     LPF_Offset.init(0);
     SnrMean.reset();
     RFmodeLastCycled = now; // give another 3 sec for lock to occur
 
-    // The caller MUST call hwTimer.resume(). It is not done here because
+    // The caller MUST call hwTimer::resume(). It is not done here because
     // the timer ISR will fire immediately and preempt any other code
 }
 
@@ -813,12 +866,6 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPkt
     if (connectionState != connected || SwitchModePending)
         return;
 
-    if (firmwareOptions.is_airport)
-    {
-        OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
-        return;
-    }
-
     bool telemetryConfirmValue = OtaUnpackChannelData(otaPktPtr, ChannelData, ExpressLRS_currTlmDenom);
     TelemetrySender.ConfirmCurrentPayload(telemetryConfirmValue);
 
@@ -828,7 +875,10 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPkt
         if (ExpressLRS_currAirRate_Modparams->numOfSends == 1)
         {
             crsfRCFrameAvailable();
-            servoNewChannelsAvaliable();
+            // teamrace is only checked for servos because the teamrace model select logic only runs
+            // when new frames are available, and will decide later if the frame will be forwarded
+            if (teamraceHasModelMatch)
+                servoNewChannelsAvailable();
         }
         else if (!LQCalcDVDA.currentIsSet())
         {
@@ -838,6 +888,23 @@ static void ICACHE_RAM_ATTR ProcessRfPacket_RC(OTA_Packet_s const * const otaPkt
         debugRcvrLinkstatsPending = true;
         #endif
     }
+}
+
+void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t* newUid4)
+{
+    // Binding over MSP only contains 4 bytes due to packet size limitations, clear out any leading bytes
+    UID[0] = 0;
+    UID[1] = 0;
+    for (unsigned i = 0; i < 4; i++)
+    {
+        UID[i + 2] = newUid4[i];
+    }
+
+    DBGLN("New UID = %u, %u, %u, %u, %u, %u", UID[0], UID[1], UID[2], UID[3], UID[4], UID[5]);
+
+    // Set new UID in eeprom
+    // EEPROM commit will happen on the main thread in ExitBindingMode()
+    config.SetUID(UID);
 }
 
 static void ICACHE_RAM_ATTR ProcessRfPacket_MSP(OTA_Packet_s const * const otaPktPtr)
@@ -986,12 +1053,6 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
         return false;
     }
 
-    // don't use telemetry packets for PFD calculation since TX does not send such data and tlm frames from other rx are not in sync
-    if (otaPktPtr->std.type == PACKET_TYPE_TLM)
-    {
-        return true;
-    }
-
     PFDloop.extEvent(beginProcessing + PACKET_TO_TOCK_SLACK);
 
     bool doStartTimer = false;
@@ -1011,6 +1072,12 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
         doStartTimer = ProcessRfPacket_SYNC(now,
             OtaIsFullRes ? &otaPktPtr->full.sync.sync : &otaPktPtr->std.sync)
             && !InBindingMode;
+        break;
+    case PACKET_TYPE_TLM:
+        if (firmwareOptions.is_airport)
+        {
+            OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
+        }
         break;
     default:
         break;
@@ -1039,7 +1106,7 @@ bool ICACHE_RAM_ATTR ProcessRFPacket(SX12xxDriverCommon::rx_status const status)
     if (otaPktPtr->std.type != PACKET_TYPE_SYNC) DBGW(connectionHasModelMatch ? 'R' : 'r');
 #endif
     if (doStartTimer)
-        hwTimer.resume(); // will throw an interrupt immediately
+        hwTimer::resume(); // will throw an interrupt immediately
 
     return true;
 }
@@ -1061,10 +1128,9 @@ bool ICACHE_RAM_ATTR RXdoneISR(SX12xxDriverCommon::rx_status const status)
 
 void ICACHE_RAM_ATTR TXdoneISR()
 {
-#if defined(Regulatory_Domain_EU_CE_2400)
-    BeginClearChannelAssessment();
-#else
     Radio.RXnb();
+#if defined(Regulatory_Domain_EU_CE_2400)
+    SetClearChannelAssessmentTime();
 #endif
 #if defined(DEBUG_RX_SCOREBOARD)
     DBGW('T');
@@ -1077,57 +1143,66 @@ void UpdateModelMatch(uint8_t model)
     config.SetModelId(model);
 }
 
+void SendMSPFrameToFC(uint8_t *mspData)
+{
+    serialIO->queueMSPFrameTransmission(mspData);
+}
+
 /**
  * Process the assembled MSP packet in MspData[]
  **/
 void MspReceiveComplete()
 {
-    if (MspData[7] == MSP_SET_RX_CONFIG && MspData[8] == MSP_ELRS_MODEL_ID)
+    switch (MspData[0])
     {
-        UpdateModelMatch(MspData[9]);
-    }
-    else if (MspData[0] == MSP_ELRS_SET_RX_WIFI_MODE)
-    {
+    case MSP_ELRS_SET_RX_WIFI_MODE: //0x0E
 #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
         // The MSP packet needs to be ACKed so the TX doesn't
         // keep sending it, so defer the switch to wifi
-        deferExecution(500, []() {
+        deferExecutionMillis(500, []() {
             setWifiUpdateMode();
         });
 #endif
-    }
-    else if (MspData[0] == MSP_ELRS_SET_RX_LOAN_MODE)
-    {
-        loanBindTimeout = LOAN_BIND_TIMEOUT_MSP;
-        InLoanBindingMode = true;
-    }
-    else if (OPT_HAS_VTX_SPI && MspData[7] == MSP_SET_VTX_CONFIG)
-    {
-        vtxSPIBandChannelIdx = MspData[8];
-        if (MspData[6] >= 4) // If packet has 4 bytes it also contains power idx and pitmode.
-        {
-            vtxSPIPowerIdx = MspData[10];
-            vtxSPIPitmode = MspData[11];
-        }
-        devicesTriggerEvent();
-    }
-    else
-    {
+        break;
+    default:
+        //handle received CRSF package
         crsf_ext_header_t *receivedHeader = (crsf_ext_header_t *) MspData;
-
-        // No MSP data to the FC if no model match
-        if (connectionHasModelMatch && (receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_FLIGHT_CONTROLLER))
+        switch (receivedHeader->type)
         {
-            serialIO->sendMSPFrameToFC(MspData);
+        case CRSF_FRAMETYPE_MSP_WRITE: //encapsulated MSP payload
+            if (MspData[7] == MSP_SET_RX_CONFIG && MspData[8] == MSP_ELRS_MODEL_ID)
+            {
+                UpdateModelMatch(MspData[9]);
+                break;
+            }
+            else if (OPT_HAS_VTX_SPI && MspData[7] == MSP_SET_VTX_CONFIG)
+            {
+                vtxSPIFrequency = getFreqByIdx(MspData[8]);
+                if (MspData[6] >= 4) // If packet has 4 bytes it also contains power idx and pitmode.
+                {
+                    vtxSPIPowerIdx = MspData[10];
+                    vtxSPIPitmode = MspData[11];
+                }
+                devicesTriggerEvent();
+                break;
+            }
+            // FALLTHROUGH
+        default:
+            if ((receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_CRSF_RECEIVER))
+            {
+                luaParamUpdateReq(
+                    MspData[CRSF_TELEMETRY_TYPE_INDEX],
+                    MspData[CRSF_TELEMETRY_FIELD_ID_INDEX],
+                    MspData[CRSF_TELEMETRY_FIELD_CHUNK_INDEX]
+                );
+            }
+            break;
         }
-
-        if ((receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_CRSF_RECEIVER))
+        // No MSP data to the FC if no model match
+        if (connectionHasModelMatch && teamraceHasModelMatch &&
+            (receivedHeader->dest_addr == CRSF_ADDRESS_BROADCAST || receivedHeader->dest_addr == CRSF_ADDRESS_FLIGHT_CONTROLLER))
         {
-            luaParamUpdateReq(
-                MspData[CRSF_TELEMETRY_TYPE_INDEX],
-                MspData[CRSF_TELEMETRY_FIELD_ID_INDEX],
-                MspData[CRSF_TELEMETRY_FIELD_CHUNK_INDEX]
-            );
+            serialIO->queueMSPFrameTransmission(MspData);
         }
     }
 
@@ -1137,13 +1212,24 @@ void MspReceiveComplete()
 static void setupSerial()
 {
     bool sbusSerialOutput = false;
+	bool sumdSerialOutput = false;
+
+#if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
+    bool hottTlmSerial = false;
+#endif
 
     if (OPT_CRSF_RCVR_NO_SERIAL)
     {
         // For PWM receivers with no serial pins defined, only turn on the Serial port if logging is on
-        #if defined(DEBUG_LOG)
+        #if defined(DEBUG_LOG) || defined(DEBUG_RCVR_LINKSTATS)
+        #if defined(PLATFORM_ESP32_S3) && !defined(ESP32_S3_USB_JTAG_ENABLED)
+        // Requires pull-down on GPIO3.  If GPIO3 has a pull-up (for JTAG) this doesn't work.
+        USBSerial.begin(serialBaud);
+        SerialLogger = &USBSerial;
+        #else
         Serial.begin(serialBaud);
         SerialLogger = &Serial;
+        #endif
         #else
         SerialLogger = new NullStream();
         #endif
@@ -1151,12 +1237,24 @@ static void setupSerial()
         return;
     }
 
-    if (config.GetSerialProtocol() == PROTOCOL_SBUS || config.GetSerialProtocol() == PROTOCOL_INVERTED_SBUS)
+    if (config.GetSerialProtocol() == PROTOCOL_SBUS || config.GetSerialProtocol() == PROTOCOL_INVERTED_SBUS || config.GetSerialProtocol() == PROTOCOL_DJI_RS_PRO)
     {
         sbusSerialOutput = true;
         serialBaud = 100000;
     }
-    bool invert = config.GetSerialProtocol() == PROTOCOL_SBUS || config.GetSerialProtocol() == PROTOCOL_INVERTED_CRSF;
+	else if (config.GetSerialProtocol() == PROTOCOL_SUMD)
+    {
+        sumdSerialOutput = true;
+        serialBaud = 115200;
+    }
+#if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
+    else if (config.GetSerialProtocol() == PROTOCOL_HOTT_TLM)
+    {
+        hottTlmSerial = true;
+        serialBaud = 19200;
+    }
+#endif
+    bool invert = config.GetSerialProtocol() == PROTOCOL_SBUS || config.GetSerialProtocol() == PROTOCOL_INVERTED_CRSF || config.GetSerialProtocol() == PROTOCOL_DJI_RS_PRO;
 
 #ifdef PLATFORM_STM32
 #if defined(TARGET_R9SLIMPLUS_RX)
@@ -1210,12 +1308,32 @@ static void setupSerial()
 #endif
 
 #if defined(PLATFORM_ESP8266)
-    SerialConfig config = sbusSerialOutput ? SERIAL_8E2 : SERIAL_8N1;
-    SerialMode mode = sbusSerialOutput ? SERIAL_TX_ONLY : SERIAL_FULL;
+    SerialConfig config = SERIAL_8N1;
+
+    if(sbusSerialOutput)
+    {
+        config = SERIAL_8E2;
+    }
+    else if(hottTlmSerial)
+    {
+        config = SERIAL_8N2;
+    }
+
+    SerialMode mode = (sbusSerialOutput || sumdSerialOutput)  ? SERIAL_TX_ONLY : SERIAL_FULL;
     Serial.begin(serialBaud, config, mode, -1, invert);
 #elif defined(PLATFORM_ESP32)
-    uint32_t config = sbusSerialOutput ? SERIAL_8E2 : SERIAL_8N1;
-    Serial.begin(serialBaud, config, -1, -1, invert);
+    uint32_t config = SERIAL_8N1;
+
+    if(sbusSerialOutput)
+    {
+        config = SERIAL_8E2;
+    }
+    else if(hottTlmSerial)
+    {
+        config = SERIAL_8N2;
+    }
+
+    Serial.begin(serialBaud, config, GPIO_PIN_RCSIGNAL_RX, GPIO_PIN_RCSIGNAL_TX, invert);
 #endif
 
     if (firmwareOptions.is_airport)
@@ -1226,11 +1344,30 @@ static void setupSerial()
     {
         serialIO = new SerialSBUS(SERIAL_PROTOCOL_TX, SERIAL_PROTOCOL_RX);
     }
+    else if (sumdSerialOutput)
+    {
+        serialIO = new SerialSUMD(SERIAL_PROTOCOL_TX, SERIAL_PROTOCOL_RX);
+    }
+    #if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
+    else if (hottTlmSerial)
+    {
+        serialIO = new SerialHoTT_TLM(SERIAL_PROTOCOL_TX, SERIAL_PROTOCOL_RX);
+    }
+    #endif
     else
     {
         serialIO = new SerialCRSF(SERIAL_PROTOCOL_TX, SERIAL_PROTOCOL_RX);
     }
+#if defined(DEBUG_ENABLED)
+#if defined(PLATFORM_ESP32_S3) || defined(PLATFORM_ESP32_C3)
+    USBSerial.begin(460800);
+    SerialLogger = &USBSerial;
+#else
     SerialLogger = &Serial;
+#endif
+#else
+    SerialLogger = new NullStream();
+#endif
 }
 
 static void serialShutdown()
@@ -1259,35 +1396,21 @@ static void setupConfigAndPocCheck()
     config.SetStorageProvider(&eeprom); // Pass pointer to the Config class for access to storage
     config.Load();
 
-    bool doPowerCount = config.GetOnLoan() || !firmwareOptions.hasUID;
-    if (doPowerCount)
+    // If bound, track number of plug/unplug cycles to go to binding mode in eeprom
+    if (config.GetIsBound() && config.GetPowerOnCounter() < 3)
     {
-        DBGLN("Doing power-up check for loan revocation and/or re-binding");
-        // Increment the power on counter in eeprom
         config.SetPowerOnCounter(config.GetPowerOnCounter() + 1);
         config.Commit();
-
-        if (config.GetPowerOnCounter() >= 3)
-        {
-            if (config.GetOnLoan())
-            {
-                config.SetOnLoan(false);
-                config.SetPowerOnCounter(0);
-                config.Commit();
-            }
-        }
-        else
-        {
-            // We haven't reached our binding mode power cycles
-            // and we've been powered on for 2s, reset the power on counter.
-            // config.Commit() is done in the loop with CheckConfigChangePending().
-            deferExecution(2000, []() {
-                config.SetPowerOnCounter(0);
-            });
-        }
     }
 
-    DBGLN("ModelId=%u", config.GetModelId());
+    // Set a deferred function to clear the power on counter if the RX has been running for more than 2s
+    deferExecutionMillis(2000, []() {
+        if (connectionState != connected && config.GetPowerOnCounter() != 0)
+        {
+            config.SetPowerOnCounter(0);
+            config.Commit();
+        }
+    });
 }
 
 static void setupTarget()
@@ -1313,32 +1436,27 @@ static void setupTarget()
 
 static void setupBindingFromConfig()
 {
-    // Use the user defined binding phase if set,
-    // otherwise use the bind flag and UID in eeprom for UID
-    if (config.GetOnLoan())
+    // VolatileBind's only function is to prevent loading the stored UID into RAM
+    // which makes the RX boot into bind mode every time
+    if (config.GetIsBound())
     {
-        DBGLN("RX has been loaned, reading the UID from eeprom...");
-        memcpy(UID, config.GetOnLoanUID(), sizeof(UID));
-    }
-    // Check the byte that indicates if RX has been bound
-    else if (!firmwareOptions.hasUID && config.GetIsBound())
-    {
-        DBGLN("RX has been bound previously, reading the UID from eeprom...");
-        memcpy(UID, config.GetUID(), sizeof(UID));
+        memcpy(UID, config.GetUID(), UID_LEN);
     }
 
-    DBGLN("UID = %d, %d, %d, %d, %d, %d", UID[0], UID[1], UID[2], UID[3], UID[4], UID[5]);
+    DBGLN("UID=(%d, %d, %d, %d, %d, %d) ModelId=%u",
+        UID[0], UID[1], UID[2], UID[3], UID[4], UID[5], config.GetModelId());
+
     OtaUpdateCrcInitFromUid();
 }
 
 static void setupRadio()
 {
-    Radio.currFreq = GetInitialFreq();
+    Radio.currFreq = FHSSgetInitialFreq();
 #if defined(RADIO_SX127X)
     //Radio.currSyncWord = UID[3];
 #endif
-    bool init_success = Radio.Begin();
-    POWERMGNT.init();
+    bool init_success = Radio.Begin(FHSSgetMinimumFreq(), FHSSgetMaximumFreq());
+    POWERMGNT::init();
     if (!init_success)
     {
         DBGLN("Failed to detect RF chipset!!!");
@@ -1346,7 +1464,7 @@ static void setupRadio()
         return;
     }
 
-    POWERMGNT.setPower((PowerLevels_e)config.GetPower());
+    DynamicPower_UpdateRx(true);
 
 #if defined(Regulatory_Domain_EU_CE_2400)
     LBTEnabled = (config.GetPower() > PWR_10mW);
@@ -1356,7 +1474,7 @@ static void setupRadio()
     Radio.TXdoneCallback = &TXdoneISR;
 
     scanIndex = config.GetRateInitialIdx();
-    SetRFLinkRate(scanIndex);
+    SetRFLinkRate(scanIndex, false);
     // Start slow on the selected rate to give it the best chance
     // to connect before beginning rate cycling
     RFmodeCycleMultiplier = RFmodeCycleMultiplierSlow / 2;
@@ -1368,7 +1486,7 @@ static void updateTelemetryBurst()
         return;
     telemBurstValid = true;
 
-    uint32_t hz = RateEnumToHz(ExpressLRS_currAirRate_Modparams->enum_rate);
+    uint16_t hz = 1000000 / ExpressLRS_currAirRate_Modparams->interval;
     telemetryBurstMax = TLMBurstMaxForRateRatio(hz, ExpressLRS_currTlmDenom);
 
     // Notify the sender to adjust its expected throughput
@@ -1389,9 +1507,9 @@ static void cycleRfMode(unsigned long now)
         RFmodeLastCycled = now;
         LastSyncPacket = now;           // reset this variable
         SendLinkStatstoFCForcedSends = 2;
-        SetRFLinkRate(scanIndex % RATE_MAX); // switch between rates
-        LQCalc.reset();
-        LQCalcDVDA.reset();
+        SetRFLinkRate(scanIndex % RATE_MAX, false); // switch between rates
+        LQCalc.reset100();
+        LQCalcDVDA.reset100();
         // Display the current air rate to the user as an indicator something is happening
         scanIndex++;
         Radio.RXnb();
@@ -1402,56 +1520,134 @@ static void cycleRfMode(unsigned long now)
     } // if time to switch RF mode
 }
 
-static void updateBindingMode(unsigned long now)
+static void EnterBindingMode()
 {
-#ifndef MY_UID
-    // If the eeprom is indicating that we're not bound
-    // and we're not already in binding mode, enter binding
-    if (!config.GetIsBound() && !InBindingMode)
+    if (InBindingMode)
     {
-        INFOLN("RX has not been bound, enter binding mode...");
+        DBGLN("Already in binding mode");
+        return;
+    }
+
+    // Binding uses a CRCInit=0, 50Hz, and InvertIQ
+    OtaCrcInitializer = 0;
+    InBindingMode = true;
+
+    // Start attempting to bind
+    // Lock the RF rate and freq while binding
+    SetRFLinkRate(enumRatetoIndex(RATE_BINDING), true);
+    Radio.SetFrequencyReg(FHSSgetInitialFreq());
+    if (geminiMode)
+    {
+        Radio.SetFrequencyReg(FHSSgetInitialGeminiFreq(), SX12XX_Radio_2);
+    }
+    // If the Radio Params (including InvertIQ) parameter changed, need to restart RX to take effect
+    Radio.RXnb();
+
+    DBGLN("Entered binding mode at freq = %d", Radio.currFreq);
+    devicesTriggerEvent();
+}
+
+static void ExitBindingMode()
+{
+    if (!InBindingMode)
+    {
+        DBGLN("Not in binding mode");
+        return;
+    }
+
+    MspReceiver.ResetState();
+
+    // Prevent any new packets from coming in
+    Radio.SetTxIdleMode();
+    // Write the values to eeprom
+    config.Commit();
+
+    OtaUpdateCrcInitFromUid();
+    FHSSrandomiseFHSSsequence(uidMacSeedGet());
+
+    #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+    webserverPreventAutoStart = true;
+    #endif
+
+    // Force RF cycling to start at the beginning immediately
+    scanIndex = RATE_MAX;
+    RFmodeLastCycled = 0;
+    LockRFmode = false;
+    LostConnection(false);
+
+    // Do this last as LostConnection() will wait for a tock that never comes
+    // if we're in binding mode
+    InBindingMode = false;
+    DBGLN("Exiting binding mode");
+    devicesTriggerEvent();
+}
+
+static void updateBindingMode()
+{
+    // Exit binding mode if the config has been modified, indicating UID has been set
+    if (InBindingMode && config.IsModified())
+    {
+        ExitBindingMode();
+    }
+
+    // If the power on counter is >=3, enter binding, the counter will be reset after 2s
+    else if (config.GetPowerOnCounter() >= 3)
+    {
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+        // Never enter wifi if forced to binding mode
+        webserverPreventAutoStart = true;
+#endif
+        DBGLN("Power on counter >=3, enter binding mode...");
         EnterBindingMode();
+    }
+
+    // If the eeprom is indicating that we're not bound, enter binding
+    else if (!UID_IS_BOUND(UID) && !InBindingMode)
+    {
+        DBGLN("RX has not been bound, enter binding mode...");
+        EnterBindingMode();
+    }
+
+    else if (BindingModeRequest)
+    {
+        DBGLN("Connected request to enter binding mode...");
+        BindingModeRequest = false;
+        if (connectionState == connected)
+            LostConnection(false);
+        EnterBindingMode();
+    }
+}
+
+void EnterBindingModeSafely()
+{
+    // Will not enter Binding mode if in the process of a passthrough update
+    // or currently binding
+    if (connectionState == serialUpdate || InBindingMode)
+        return;
+
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+    // Never enter wifi mode after requesting to enter binding mode
+    webserverPreventAutoStart = true;
+
+    // If the radio and everything is shut down, better to reboot and boot to binding mode
+    if (connectionState == wifiUpdate || connectionState == bleJoystick)
+    {
+        // Force 3-plug binding mode
+        config.SetPowerOnCounter(3);
+        config.Commit();
+        ESP.restart();
+        // Unreachable
     }
 #endif
-    // If in "loan" binding mode and we're not configured then start binding
-    if (!InBindingMode && InLoanBindingMode && !config.GetOnLoan()) {
-        EnterBindingMode();
-    }
-    // If in "loan" binding mode and the bind packet has come in, leave binding mode
-    else if (InBindingMode && InLoanBindingMode && config.GetOnLoan()) {
-        ExitBindingMode();
-    }
-    // If in binding mode and the bind packet has come in, leave binding mode
-    else if (InBindingMode && !InLoanBindingMode && config.GetIsBound())
+
+    // If connected, handle that in updateBindingMode()
+    if (connectionState == connected)
     {
-        ExitBindingMode();
-    }
-    // If in "loan" binding mode and we've been here for more than timeout period, reset UID and leave binding mode
-    else if (InBindingMode && InLoanBindingMode && (now - loadBindingStartedMs) > loanBindTimeout) {
-        loanBindTimeout = LOAN_BIND_TIMEOUT_DEFAULT;
-        memcpy(UID, MasterUID, sizeof(MasterUID));
-        setupBindingFromConfig();
-        ExitBindingMode();
-    }
-    // If returning the model to the owner, set the flag and call ExitBindingMode to reset the CRC and FHSS
-    else if (returnModelFromLoan && config.GetOnLoan()) {
-        LostConnection(false);
-        config.SetOnLoan(false);
-        memcpy(UID, MasterUID, sizeof(MasterUID));
-        setupBindingFromConfig();
-        ExitBindingMode();
+        BindingModeRequest = true;
+        return;
     }
 
-    // If the power on counter is >=3, enter binding and clear counter
-    if (!firmwareOptions.hasUID && config.GetPowerOnCounter() >= 3)
-    {
-        config.SetPowerOnCounter(0);
-        config.Commit();
-
-        INFOLN("Power on counter >=3, enter binding mode...");
-        config.SetIsBound(false);
-        EnterBindingMode();
-    }
+    EnterBindingMode();
 }
 
 static void checkSendLinkStatsToFc(uint32_t now)
@@ -1463,10 +1659,10 @@ static void checkSendLinkStatsToFc(uint32_t now)
             getRFlinkInfo();
         }
 
-        if ((connectionState != disconnected && connectionHasModelMatch) ||
+        if ((connectionState != disconnected && connectionHasModelMatch && teamraceHasModelMatch) ||
             SendLinkStatstoFCForcedSends)
         {
-            serialIO->sendLinkStatisticsToFC();
+            serialIO->queueLinkStatisticsPacket();
             SendLinkStatstoFCintervalLastSent = now;
             if (SendLinkStatstoFCForcedSends)
                 --SendLinkStatstoFCForcedSends;
@@ -1483,7 +1679,7 @@ static void debugRcvrLinkstats()
 
         // Copy the data out of the ISR-updating bits ASAP
         // While YOLOing (const void *) away the volatile
-        crsfLinkStatistics_t ls = *(crsfLinkStatistics_t *)((const void *)&crsf.LinkStatistics);
+        crsfLinkStatistics_t ls = *(crsfLinkStatistics_t *)((const void *)&CRSF::LinkStatistics);
         uint32_t packetCounter = debugRcvrLinkstatsPacketId;
         uint8_t fhss = debugRcvrLinkstatsFhssIdx;
         // actually the previous packet's offset since the update happens in tick, and this will
@@ -1502,6 +1698,47 @@ static void debugRcvrLinkstats()
 #endif
 }
 
+static void debugRcvrSignalStats(uint32_t now)
+{
+#if defined(DEBUG_RCVR_SIGNAL_STATS)
+    static uint32_t lastReport = 0;
+
+    // log column header:  cnt1, rssi1, snr1, snr1_max, telem1, fail1, cnt2, rssi2, snr2, snr2_max, telem2, fail2, or, both
+    if(now - lastReport >= 1000 && connectionState == connected)
+    {
+        for (int i = 0 ; i < (isDualRadio()?2:1) ; i++)
+        {
+            DBG("%d\t%f\t%f\t%f\t%d\t%d\t",
+                Radio.rxSignalStats[i].irq_count,
+                (Radio.rxSignalStats[i].irq_count==0) ? 0 : double(Radio.rxSignalStats[i].rssi_sum)/Radio.rxSignalStats[i].irq_count,
+                (Radio.rxSignalStats[i].irq_count==0) ? 0 : double(Radio.rxSignalStats[i].snr_sum)/Radio.rxSignalStats[i].irq_count/RADIO_SNR_SCALE,
+                float(Radio.rxSignalStats[i].snr_max)/RADIO_SNR_SCALE,
+                Radio.rxSignalStats[i].telem_count,
+                Radio.rxSignalStats[i].fail_count);
+
+                Radio.rxSignalStats[i].irq_count = 0;
+                Radio.rxSignalStats[i].snr_sum = 0;
+                Radio.rxSignalStats[i].rssi_sum = 0;
+                Radio.rxSignalStats[i].snr_max = INT8_MIN;
+                Radio.rxSignalStats[i].telem_count = 0;
+                Radio.rxSignalStats[i].fail_count = 0;
+        }
+        if (isDualRadio())
+        {
+            DBGLN("%d\t%d", Radio.irq_count_or, Radio.irq_count_both);
+        }
+        else
+        {
+            DBGLN("");
+        }
+        Radio.irq_count_or = 0;
+        Radio.irq_count_both = 0;
+
+        lastReport = now;
+    }
+#endif
+}
+
 static void updateSwitchMode()
 {
     // Negative value means waiting for confirm of the new switch mode while connected
@@ -1514,7 +1751,7 @@ static void updateSwitchMode()
 
 static void CheckConfigChangePending()
 {
-    if (config.IsModified() && !InBindingMode && connectionState != wifiUpdate)
+    if (config.IsModified() && !InBindingMode && connectionState < NO_CONFIG_SAVE_STATES)
     {
         LostConnection(false);
         config.Commit();
@@ -1554,6 +1791,10 @@ void resetConfigAndReboot()
     yield();
     // Remove options.json and hardware.json
     SPIFFS.format();
+    yield();
+    SPIFFS.begin();
+    options_SetTrueDefaults();
+
     ESP.restart();
 #endif
 }
@@ -1561,13 +1802,13 @@ void resetConfigAndReboot()
 void setup()
 {
     #if defined(TARGET_UNIFIED_RX)
-    // Setup default logging in case of failure, or no layout
-    Serial.begin(115200);
-    SerialLogger = &Serial;
-
     hardwareConfigured = options_init();
     if (!hardwareConfigured)
     {
+        // In the failure case we set the logging to the null logger so nothing crashes
+        // if it decides to log something
+        SerialLogger = new NullStream();
+
         // Register the WiFi with the framework
         static device_affinity_t wifi_device[] = {
             {&WIFI_device, 1}
@@ -1577,6 +1818,8 @@ void setup()
 
         connectionState = hardwareUndefined;
     }
+    #else
+    hardwareConfigured = options_init();
     #endif
 
     if (hardwareConfigured)
@@ -1593,11 +1836,17 @@ void setup()
         SerialLogger = new NullStream();
         #endif
 
-        initUID();
+        // External EEPROM needs I2C setup so it can load config
+        // but configurable I2C pins for PWM RX needs config loaded first
+#if (defined(TARGET_USE_EEPROM) && defined(USE_I2C))
         setupTarget();
-
+#endif
         // Init EEPROM and load config, checking powerup count
         setupConfigAndPocCheck();
+#if !(defined(TARGET_USE_EEPROM) && defined(USE_I2C))
+        setupTarget();
+#endif
+
         #if defined(OPT_HAS_SERVO_OUTPUT)
         // If serial is not already defined, then see if there is serial pin configured in the PWM configuration
         if (GPIO_PIN_RCSIGNAL_RX == UNDEF_PIN && GPIO_PIN_RCSIGNAL_TX == UNDEF_PIN)
@@ -1615,8 +1864,6 @@ void setup()
         #endif
         setupSerial();
 
-        INFOLN("ExpressLRS Module Booting...");
-
         devicesRegister(ui_devices, ARRAY_SIZE(ui_devices));
         devicesInit();
 
@@ -1631,21 +1878,22 @@ void setup()
             // RFnoiseFloor = MeasureNoiseFloor(); //TODO move MeasureNoiseFloor to driver libs
             // DBGLN("RF noise floor: %d dBm", RFnoiseFloor);
 
-            hwTimer.callbackTock = &HWtimerCallbackTock;
-            hwTimer.callbackTick = &HWtimerCallbackTick;
-
             MspReceiver.SetDataToReceive(MspData, ELRS_MSP_BUFFER);
             Radio.RXnb();
-            hwTimer.init();
+            hwTimer::init(HWtimerCallbackTick, HWtimerCallbackTock);
         }
     }
 
 #if defined(HAS_BUTTON)
-    registerButtonFunction(ACTION_BIND, EnterBindingMode);
+    registerButtonFunction(ACTION_BIND, EnterBindingModeSafely);
     registerButtonFunction(ACTION_RESET_REBOOT, resetConfigAndReboot);
 #endif
 
     devicesStart();
+    
+    // setup() eats up some of this time, which can cause the first mode connection to fail.
+    // Resetting the time here give the first mode a better chance of connection.
+    RFmodeLastCycled = millis();
 }
 
 void loop()
@@ -1667,7 +1915,13 @@ void loop()
     #endif
 
     CheckConfigChangePending();
-    executeDeferredFunction(now);
+    executeDeferredFunction(micros());
+
+    // Clear the power-on-count
+    if ((connectionState == connected || connectionState == tentative) && config.GetPowerOnCounter() != 0)
+    {
+        config.SetPowerOnCounter(0);
+    }
 
     if (connectionState > MODE_STATES)
     {
@@ -1719,10 +1973,13 @@ void loop()
         TelemetrySender.SetDataToTransmit(nextPayload, nextPlayloadSize);
     }
     updateTelemetryBurst();
-    updateBindingMode(now);
+    updateBindingMode();
     updateSwitchMode();
     checkGeminiMode();
+    DynamicPower_UpdateRx(false);
     debugRcvrLinkstats();
+    debugRcvrSignalStats(now);
+    Radio.ignoreSecondIRQ = false;
 }
 
 struct bootloader {
@@ -1758,109 +2015,4 @@ void reset_into_bootloader(void)
     delay(100);
     connectionState = serialUpdate;
 #endif
-}
-
-void EnterBindingMode()
-{
-    if (InLoanBindingMode)
-    {
-        loadBindingStartedMs = millis();
-        LostConnection(false);
-    }
-    else if (connectionState == connected || InBindingMode)
-    {
-        // Don't enter binding if:
-        // - we're already connected
-        // - we're already binding
-        DBGLN("Cannot enter binding mode!");
-        return;
-    }
-
-    // Set UID to special binding values
-    UID[0] = BindingUID[0];
-    UID[1] = BindingUID[1];
-    UID[2] = BindingUID[2];
-    UID[3] = BindingUID[3];
-    UID[4] = BindingUID[4];
-    UID[5] = BindingUID[5];
-
-    OtaCrcInitializer = 0;
-    InBindingMode = true;
-
-    // Start attempting to bind
-    // Lock the RF rate and freq while binding
-    SetRFLinkRate(enumRatetoIndex(RATE_BINDING));
-    Radio.SetFrequencyReg(GetInitialFreq());
-    if (geminiMode)
-    {
-        Radio.SetFrequencyReg(FHSSgetInitialGeminiFreq(), SX12XX_Radio_2);
-    }
-    // If the Radio Params (including InvertIQ) parameter changed, need to restart RX to take effect
-    Radio.RXnb();
-
-    DBGLN("Entered binding mode at freq = %d", Radio.currFreq);
-    devicesTriggerEvent();
-}
-
-void ExitBindingMode()
-{
-    if (!InBindingMode && !returnModelFromLoan)
-    {
-        // Not in binding mode
-        DBGLN("Cannot exit binding mode, not in binding mode!");
-        return;
-    }
-
-    MspReceiver.ResetState();
-
-    // Prevent any new packets from coming in
-    Radio.SetTxIdleMode();
-    // Write the values to eeprom
-    config.Commit();
-
-    OtaUpdateCrcInitFromUid();
-    FHSSrandomiseFHSSsequence(uidMacSeedGet());
-
-    #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
-    webserverPreventAutoStart = true;
-    #endif
-
-    // Force RF cycling to start at the beginning immediately
-    scanIndex = RATE_MAX;
-    RFmodeLastCycled = 0;
-    LockRFmode = false;
-    LostConnection(false);
-
-    // Do this last as LostConnection() will wait for a tock that never comes
-    // if we're in binding mode
-    InBindingMode = false;
-    InLoanBindingMode = false;
-    returnModelFromLoan = false;
-    DBGLN("Exiting binding mode");
-    devicesTriggerEvent();
-}
-
-void ICACHE_RAM_ATTR OnELRSBindMSP(uint8_t* newUid4)
-{
-    for (int i = 0; i < 4; i++)
-    {
-        UID[i + 2] = newUid4[i];
-    }
-
-    DBGLN("New UID = %d, %d, %d, %d, %d, %d", UID[0], UID[1], UID[2], UID[3], UID[4], UID[5]);
-
-    // Set new UID in eeprom
-    if (InLoanBindingMode)
-    {
-        config.SetOnLoanUID(UID);
-        config.SetOnLoan(true);
-    }
-    else
-    {
-        config.SetUID(UID);
-        // Set eeprom byte to indicate RX is bound
-        config.SetIsBound(true);
-    }
-
-    // EEPROM commit will happen on the main thread in ExitBindingMode()
 }

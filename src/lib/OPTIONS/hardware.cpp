@@ -37,6 +37,7 @@ static const struct {
     {HARDWARE_radio_nss, "radio_nss", INT},
     {HARDWARE_radio_nss_2, "radio_nss_2", INT},
     {HARDWARE_radio_rst, "radio_rst", INT},
+    {HARDWARE_radio_rst_2, "radio_rst_2", INT},
     {HARDWARE_radio_sck, "radio_sck", INT},
     {HARDWARE_radio_dcdc, "radio_dcdc", BOOL},
     {HARDWARE_radio_rfo_hf, "radio_rfo_hf", BOOL},
@@ -59,6 +60,8 @@ static const struct {
     {HARDWARE_power_pdet_slope, "power_pdet_slope", FLOAT},
     {HARDWARE_power_control, "power_control", INT},
     {HARDWARE_power_values, "power_values", ARRAY},
+    {HARDWARE_power_values2, "power_values2", ARRAY},
+    {HARDWARE_power_values_dual, "power_values_dual", ARRAY},
     {HARDWARE_joystick, "joystick", INT},
     {HARDWARE_joystick_values, "joystick_values", ARRAY},
     {HARDWARE_five_way1, "five_way1", INT},
@@ -76,7 +79,7 @@ static const struct {
     {HARDWARE_led_green_red, "led_green_red", INT},
     {HARDWARE_led_red, "led_red", INT},
     {HARDWARE_led_red_invert, "led_red_invert", BOOL},
-    {HARDWARE_led_reg_green, "led_red_green", INT},
+    {HARDWARE_led_red_green, "led_red_green", INT},
     {HARDWARE_led_rgb, "led_rgb", INT},
     {HARDWARE_led_rgb_isgrb, "led_rgb_isgrb", BOOL},
     {HARDWARE_ledidx_rgb_status, "ledidx_rgb_status", ARRAY},
@@ -117,6 +120,7 @@ static const struct {
     {HARDWARE_vbat, "vbat", INT},
     {HARDWARE_vbat_offset, "vbat_offset", INT},
     {HARDWARE_vbat_scale, "vbat_scale", INT},
+    {HARDWARE_vbat_atten, "vbat_atten", INT},
     {HARDWARE_vtx_amp_pwm, "vtx_amp_pwm", INT},
     {HARDWARE_vtx_amp_vpd, "vtx_amp_vpd", INT},
     {HARDWARE_vtx_amp_vref, "vtx_amp_vref", INT},
@@ -126,6 +130,8 @@ static const struct {
     {HARDWARE_vtx_sck, "vtx_sck", INT},
     {HARDWARE_vtx_amp_vpd_25mW, "vtx_amp_vpd_25mW", ARRAY},
     {HARDWARE_vtx_amp_vpd_100mW, "vtx_amp_vpd_100mW", ARRAY},
+    {HARDWARE_vtx_amp_pwm_25mW, "vtx_amp_pwm_25mW", ARRAY},
+    {HARDWARE_vtx_amp_pwm_100mW, "vtx_amp_pwm_100mW", ARRAY},
 };
 
 typedef union {

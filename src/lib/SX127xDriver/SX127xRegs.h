@@ -23,14 +23,6 @@ typedef enum
 #if defined(RADIO_SX1272)
 typedef enum
 {
-    // Only 125 to 500 KHZ supported
-    SX127x_BW_7_80_KHZ = 0b00000000,
-    SX127x_BW_10_40_KHZ = 0b00000000,
-    SX127x_BW_15_60_KHZ = 0b00000000,
-    SX127x_BW_20_80_KHZ = 0b00000000,
-    SX127x_BW_31_25_KHZ = 0b00000000,
-    SX127x_BW_41_70_KHZ = 0b00000000,
-    SX127x_BW_62_50_KHZ = 0b00000000,
     SX127x_BW_125_00_KHZ = 0b00000000,
     SX127x_BW_250_00_KHZ = 0b01000000,
     SX127x_BW_500_00_KHZ = 0b10000000
@@ -38,13 +30,6 @@ typedef enum
 #else
 typedef enum
 {
-    SX127x_BW_7_80_KHZ = 0b00000000,
-    SX127x_BW_10_40_KHZ = 0b00010000,
-    SX127x_BW_15_60_KHZ = 0b00100000,
-    SX127x_BW_20_80_KHZ = 0b00110000,
-    SX127x_BW_31_25_KHZ = 0b01000000,
-    SX127x_BW_41_70_KHZ = 0b01010000,
-    SX127x_BW_62_50_KHZ = 0b01100000,
     SX127x_BW_125_00_KHZ = 0b01110000,
     SX127x_BW_250_00_KHZ = 0b10000000,
     SX127x_BW_500_00_KHZ = 0b10010000
@@ -140,10 +125,9 @@ typedef enum
 // SX127X_REG_PA_CONFIG
 #define SX127X_PA_SELECT_RFO 0b00000000    //  7     7     RFO pin output, power limited to +14 dBm
 #define SX127X_PA_SELECT_BOOST 0b10000000  //  7     7     PA_BOOST pin output, power limited to +20 dBm
-#define SX127X_OUTPUT_POWER 0b00001111     //  3     0     output power: P_out = 17 - (15 - OUTPUT_POWER) [dBm] for PA_SELECT_BOOST
+#define SX127X_PA_POWER_MASK 0b01111111    //  6     0     PA MAX_POWER and OUTPUT_POWER combined bit mask
 #define SX127X_MAX_OUTPUT_POWER_RFO_HF 0b00000000 //       Max output power when using RFO_HF
 #define SX127X_MAX_OUTPUT_POWER 0b01110000 //              Enable max output power
-#define SX127X_MAX_OUTPUT_POWER_INVALID 0b00010000 //      A value for the MaxPower field that is not used by ExpressLRS
 // SX127X_REG_OCP
 #define SX127X_OCP_OFF 0b00000000   //  5     5     PA overload current protection disabled
 #define SX127X_OCP_ON 0b00100000    //  5     5     PA overload current protection enabled
